@@ -1,0 +1,14 @@
+# Request files that contain webhook keys
+*.http
+
+# Terraform state and local data
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# Secrets
+.env
+*.pem
+*:Zone.Identifier
