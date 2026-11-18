@@ -87,7 +87,8 @@ def sync(okta, target, dry_run: bool = False) -> SyncResult:
             _apply(result, "deactivated", okta_id, existing.get("login"), "missing_from_okta",
                    dry_run, lambda i=okta_id: target.deactivate_user(i))
 
-    log.info("sync_complete", extra={**result.summary(), "dry_run": dry_run})
+    # Nested under "result" because keys like "created" collide with built-in LogRecord attributes.
+    log.info("sync_complete", extra={"result": result.summary(), "dry_run": dry_run})
     return result
 
 

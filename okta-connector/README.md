@@ -4,7 +4,7 @@ A Python connector that reads users from the Okta API and syncs them into an app
 
 The "application" is a small FastAPI app in this repo (`target_app/`) that stands in for any system with a users API.
 
-> **Status:** built and unit/integration tested against a mocked Okta. The checklist under [Verification against a real Okta tenant](#verification-against-a-real-okta-tenant) has **not** been completed yet. Don't treat it as proven until it is.
+> **Status:** working. 44 automated tests pass (Okta mocked), and the main flows were run by hand against a real Okta developer tenant on 2026-11-18; see [Verification against a real Okta tenant](#verification-against-a-real-okta-tenant). One path is covered by unit tests only: handling of Okta's own `X-Rate-Limit-Reset` header on a 429. Groups and OAuth are not built yet (see the end of this file).
 
 ## How it works
 
@@ -82,18 +82,26 @@ python -m pytest
 44 tests: pagination via `Link` header, deactivated users, 429 with `Retry-After` / `X-Rate-Limit-Reset` / neither, timeouts, retry exhaustion, bad token not retried, every sync rule, fail-closed behaviour, and end-to-end runs against the real target app with forced 429s and forced timeouts.
 
 ## Verification against a real Okta tenant
-Tick these only after running them on a real dev tenant, and paste the real output into the section below.
+Each item below was run by hand against a real Okta developer tenant, with the target app running locally. Raw logs are not included here because they contain real user names and addresses.
 
-- [ ] `python -m connector sync --dry-run` lists the expected users without writing
-- [ ] A user created in Okta appears in the target after a sync
-- [ ] A user deactivated in Okta (Admin Console -> More Actions -> Deactivate) is disabled in the target after the next sync
-- [ ] A profile change in Okta (e.g. name) updates the target
-- [ ] With `CHAOS_429_EVERY` set, the sync completes and the log shows the retries
-- [ ] With `CHAOS_SLOW_EVERY` set, a timeout is retried and the sync completes with no duplicates
-- [ ] A wrong `OKTA_API_TOKEN` fails fast (HTTP 401, one attempt, non-zero exit, target untouched)
+Verified on a real Okta developer tenant, 2026-11-18:
+- [x] `python -m connector sync --dry-run` lists the expected users without writing
+- [x] A user created in Okta appears in the target after a sync
+- [x] A user deactivated in Okta (Admin Console -> More Actions -> Deactivate) is disabled in the target after the next sync
+- [x] Users that haven't changed are left alone (the target's server log showed only the one `POST .../deactivate` and no `PUT`s on the second run)
+- [x] With `CHAOS_429_EVERY=3` on the target, a 429 mid-sync was retried after the `Retry-After` delay (log: `http_retry`, `status: 429`, `delay_s: 1.0`; server log: 429 then 201 for the same user) and the sync finished with `errors: 0`. This exercised the `Retry-After` path against the target app. Okta's own `X-Rate-Limit-Reset` path is covered by unit tests only, because I did not try to trigger a real Okta rate limit.
+- [x] With `CHAOS_SLOW_EVERY=4 CHAOS_SLOW_SECONDS=15` on the target, a request that hung past the 10s read timeout was retried (log: `request_error_retrying`, `error: ReadTimeout`, `delay_s: 0.33`, logged 10.0s after the previous action) and the sync finished with `errors: 0`. The target held exactly 3 users afterwards, with no duplicates.
+- [x] A wrong `OKTA_API_TOKEN` fails fast: one attempt and no retries, `HTTP 401` with Okta error code `E0000011` ("Invalid token provided"), "target not modified", exit code 1.
+- [x] Real pagination with `PAGE_SIZE=2`: the main list took 2 pages (2 + 2 users) and the `DEPROVISIONED` search took 2 pages (2 + 1), 7 users in total, matching the unpaged runs. The `Link: rel="next"` header was followed on a real Okta tenant.
+- [x] Target app unreachable (found by accident when it wasn't running): the connector fetched all Okta users first, then retried the target 5 times with exponential backoff (0.35s, 0.75s, 1.38s, 3.99s, 7.31s, about 14s in total), logged `retries_exhausted`, and aborted with "target not modified" and exit code 1.
+- [x] A profile change in Okta updates the target: correcting a test user's name in Okta produced one `sync_action_done` with `action: updated`, `reason: profile_changed` (`updated: 1, unchanged: 3`). Only that user's `updated_at` changed in the target.
 
 ## What broke and how I fixed it
-_Fill this in from real runs. Include the symptom, the log line or command output that showed it, the root cause, and the fix. Anything that behaved differently from what the docs or this README predicted is the most valuable thing to write down._
+**1. The first real dry run crashed at the very end with `KeyError: "Attempt to overwrite 'created' in LogRecord"`.** Authentication, pagination and the planned actions had all worked and been logged. The crash came from the final `sync_complete` log call, which passed the result counts as `extra={"created": ..., "updated": ...}`. `created` is a built-in attribute of Python's `LogRecord` (the event timestamp), and logging refuses to overwrite it. The unit tests missed it because pytest leaves the root logger at WARNING, so `log.info(...)` calls never built a record at all. Fix: the counts are now nested under one `result` key, and `tests/conftest.py` runs every test with DEBUG logging so a bad log field fails in the tests instead of on the first real run.
+
+**2. Okta's default user list hides deactivated users, confirmed on the real tenant.** On the first sync the default list returned 5 users and the `status eq "DEPROVISIONED"` search returned 2 (7 total, no overlap). After I deactivated a test user in Okta, the default list dropped to 4 and the search grew to 3. Without the second query the deactivation would never have been noticed. The next sync logged `deactivated ... reason: okta_status_deprovisioned`, the target's server log showed a single `POST /users/<id>/deactivate`, and the user was left in the target with `"active": false` (disabled, not deleted).
+
+**3. Not every Okta user gets created.** On the first sync, 3 of the 7 Okta users were not `ACTIVE` and were skipped rather than created in the target, which is the intended behaviour (`created: 4, skipped: 3` in the `sync_complete` line).
 
 ## Not built yet
 - **Groups and group membership.** Only users are synced.
